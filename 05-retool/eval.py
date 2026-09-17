@@ -77,6 +77,12 @@ def parse_args() -> argparse.Namespace:
         "--limit", type=int, default=0, help="只评测前 N 题；0 表示全部 30 题"
     )
     parser.add_argument(
+        "--start-index",
+        type=int,
+        default=0,
+        help="从第 N 题继续评测；需要 --output 已含前 N 题的逐题结果",
+    )
+    parser.add_argument(
         "--chunk-size",
         type=int,
         default=5,
@@ -110,6 +116,8 @@ def parse_args() -> argparse.Namespace:
             raise ValueError(f"--{name.replace('_', '-')} must be >= 1")
     if args.limit < 0:
         raise ValueError("--limit must be >= 0")
+    if args.start_index < 0:
+        raise ValueError("--start-index must be >= 0")
     if args.temperature < 0:
         raise ValueError("--temperature must be >= 0")
     return args
@@ -395,6 +403,20 @@ def write_results(
 async def evaluate(args: argparse.Namespace) -> None:
     """创建 PyTRIO 采样客户端，按模式完成评测和结果落盘。"""
     dataset = load_aime25(args.dataset_path, args.limit)
+    if args.start_index > len(dataset):
+        raise ValueError("--start-index exceeds selected dataset size")
+    results: list[dict[str, Any]] = []
+    if args.start_index:
+        if args.mode != "retool":
+            raise ValueError("--start-index currently supports retool mode only")
+        if not args.output.exists():
+            raise FileNotFoundError(f"Cannot resume: {args.output} does not exist")
+        with args.output.open(encoding="utf-8") as file:
+            results = [json.loads(line) for line in file if line.strip()]
+        if [item.get("problem_id") for item in results] != list(range(args.start_index)):
+            raise ValueError("Existing results must contain exactly the preceding problems")
+        if any(len(item.get("generations", [])) != args.val_n for item in results):
+            raise ValueError("Existing results have a different --val-n")
     service_client = trio.ServiceClient()
     sampling_client = await service_client.create_sampling_client_async(
         base_model=args.base_model,
@@ -402,7 +424,6 @@ async def evaluate(args: argparse.Namespace) -> None:
     )
     tokenizer = sampling_client.get_tokenizer()
 
-    results: list[dict[str, Any]] = []
     if args.mode == "text-only":
         semaphore = asyncio.Semaphore(args.concurrency)
         with tqdm(total=len(dataset), desc="AIME25 text-only", unit="problem") as progress:
@@ -425,13 +446,13 @@ async def evaluate(args: argparse.Namespace) -> None:
             timeout=args.sandbox_timeout,
             max_workers=args.sandbox_workers,
         )
-        indexed_rows = list(enumerate(dataset))
+        indexed_rows = list(enumerate(dataset))[args.start_index :]
         chunks = [
             indexed_rows[offset : offset + args.chunk_size]
             for offset in range(0, len(indexed_rows), args.chunk_size)
         ]
         with tqdm(
-            total=len(dataset) * args.val_n,
+            total=len(indexed_rows) * args.val_n,
             desc="AIME25 retool",
             unit="trajectory",
         ) as progress:
@@ -441,7 +462,11 @@ async def evaluate(args: argparse.Namespace) -> None:
                 )
                 results.extend(chunk_results)
                 # 逐 chunk 落盘，长评测中途失败也保留已完成部分。
-                write_results(chunk_results, args.output, append=chunk_number > 0)
+                write_results(
+                    chunk_results,
+                    args.output,
+                    append=args.start_index > 0 or chunk_number > 0,
+                )
                 tqdm.write(
                     f"chunk {chunk_number + 1}/{len(chunks)}: "
                     f"correct={sum(r['num_correct'] for r in chunk_results)}"
